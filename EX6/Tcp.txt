@@ -1,0 +1,494 @@
+[24bcs036@mepcolinux ex6]$cat server.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <time.h>
+
+#define BUFFER_SIZE 1024
+#define MAX_RETRIES 3   /* Change this to any 'n' number of chances you want */
+
+int validate_gmail(char *usr) {
+    int len = strlen(usr);
+    if (len < 8) return 0;
+
+    const char *domain = "@gmail.com";
+    int domain_len = strlen(domain);
+    if (len < domain_len || strcmp(usr + len - domain_len, domain) != 0)
+        return 0;
+
+    int dot_count = 0;
+    for (int i = 0; i < len; i++) {
+        if (usr[i] == '.') dot_count++;
+    }
+    if (dot_count != 1) return 0;
+
+    return 1;
+}
+
+int authenticate(char *usr, char *pwd) {
+    FILE *f;
+    char u[100], p[50];
+
+    f = fopen("users.txt", "r");
+    if (f == NULL) {
+        printf("Error opening users.txt\n");
+        return 0;
+    }
+
+    while (fscanf(f, " Username:%99s Password:%49s", u, p) == 2) {
+        if (strcmp(usr, u) == 0 && strcmp(pwd, p) == 0) {
+            fclose(f);
+            return 1;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+int palindrome(char *s) {
+    int i, j;
+    j = strlen(s) - 1;
+    for (i = 0; i < j; i++, j--) {
+        if (s[i] != s[j]) return 0;
+    }
+    return 1;
+}
+
+int main() {
+    int s_d, c_d;
+    struct sockaddr_in srv, cli;
+    socklen_t len;
+    char buf[BUFFER_SIZE];
+    char usr[100], pwd[50];
+    int bytes_received;
+    int server_port;
+
+    s_d = socket(AF_INET, SOCK_STREAM, 0);
+    if (s_d < 0) {
+        perror("Socket error");
+        exit(1);
+    }
+    printf("Socket OK\n");
+
+    int opt = 1;
+    if (setsockopt(s_d, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt failed");
+        close(s_d);
+        exit(1);
+    }
+
+    srv.sin_family = AF_INET;
+    srv.sin_addr.s_addr = INADDR_ANY;
+
+    srand((unsigned int)time(NULL));
+    int bound = 0;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        server_port = 10000 + (rand() % 55536);
+        srv.sin_port = htons(server_port);
+        if (bind(s_d, (struct sockaddr *)&srv, sizeof(srv)) == 0) {
+            bound = 1;
+            break;
+        }
+    }
+    if (!bound) {
+        perror("Bind error (all attempted ports are in use)");
+        close(s_d);
+        exit(1);
+    }
+    printf("Bind OK on Generated Port: %d\n", server_port);
+
+    if (listen(s_d, 5) < 0) {
+        perror("Listen error");
+        close(s_d);
+        exit(1);
+    }
+
+    printf("=================================================\n");
+    printf("Server is listening on all interfaces\n");
+    printf("Server IP for client: 172.16.16.200\n");
+    printf("Generated Port Number: %d\n", server_port);
+    printf("Tell the client to use the above IP and Port.\n");
+    printf("=================================================\n");
+
+    /* Main outer loop: server stays alive for multiple clients */
+    while (1) {
+        len = sizeof(cli);
+        c_d = accept(s_d, (struct sockaddr *)&cli, &len);
+        if (c_d < 0) {
+            perror("Accept error");
+            continue;          /* keep server running */
+        }
+        printf("Client connected\n");
+
+        int authenticated = 0;
+        int retry;
+        for (retry = 0; retry < MAX_RETRIES; retry++) {
+            /* Request username */
+            strcpy(buf, "REQ_USERNAME");
+            send(c_d, buf, strlen(buf) + 1, 0);
+
+            memset(usr, 0, sizeof(usr));
+            bytes_received = recv(c_d, usr, sizeof(usr) - 1, 0);
+            if (bytes_received <= 0) {
+                printf("Client disconnected during username entry.\n");
+                break;
+            }
+            usr[strcspn(usr, "\r\n")] = 0;
+            printf("Received username (Gmail) from client: %s\n", usr);
+
+            if (!validate_gmail(usr)) {
+                printf("Client provided invalid Gmail format: '%s'\n", usr);
+                strcpy(buf, "LOGIN_INVALID_FORMAT");
+                send(c_d, buf, strlen(buf) + 1, 0);
+                break;          /* stop trying for this client */
+            }
+
+            /* Request password */
+            strcpy(buf, "REQ_PASSWORD");
+            send(c_d, buf, strlen(buf) + 1, 0);
+
+            memset(pwd, 0, sizeof(pwd));
+            bytes_received = recv(c_d, pwd, sizeof(pwd) - 1, 0);
+            if (bytes_received <= 0) {
+                printf("Client disconnected during password entry.\n");
+                break;
+            }
+            pwd[strcspn(pwd, "\r\n")] = 0;
+            printf("Received password from client: %s\n", pwd);
+
+            if (authenticate(usr, pwd)) {
+                printf("User '%s' authenticated successfully (attempt %d)\n", usr, retry + 1);
+                strcpy(buf, "LOGIN_SUCCESS");
+                send(c_d, buf, strlen(buf) + 1, 0);
+                authenticated = 1;
+                break;          /* auth success */
+            } else {
+                printf("Authentication failed for user '%s' with password '%s' (attempt %d/%d)\n",
+                       usr, pwd, retry + 1, MAX_RETRIES);
+                if (retry < MAX_RETRIES - 1) {
+                    strcpy(buf, "AUTH_FAIL");   /* ask client to retry */
+                    send(c_d, buf, strlen(buf) + 1, 0);
+                } else {
+                    strcpy(buf, "AUTH_DENIED"); /* all chances used */
+                    send(c_d, buf, strlen(buf) + 1, 0);
+                }
+            }
+        }
+
+        if (!authenticated) {
+            close(c_d);
+            printf("Client disconnected due to failed authentication. Server remains active.\n");
+            continue;           /* wait for next client */
+        }
+
+        /* Service loop for authenticated client */
+        while (1) {
+            char choice[10];
+            char data[BUFFER_SIZE];
+
+            memset(buf, 0, sizeof(buf));
+            bytes_received = recv(c_d, buf, sizeof(buf) - 1, 0);
+
+            if (bytes_received <= 0) {
+                printf("Client disconnected\n");
+                break;
+            }
+
+            buf[strcspn(buf, "\r\n")] = 0;
+            memset(choice, 0, sizeof(choice));
+            memset(data, 0, sizeof(data));
+            sscanf(buf, "%9s %[^\n]", choice, data);
+
+            if (strcmp(choice, "3") == 0) {
+                printf("Client requested to exit\n");
+                break;
+            }
+            else if (strcmp(choice, "1") == 0) {
+                printf("Message received: Echo\n");
+                printf("Client input for Echo: %s\n", data);
+                printf("Checking request...\n");
+                snprintf(buf, sizeof(buf), "Echo: %s", data);
+                send(c_d, buf, strlen(buf) + 1, 0);
+            }
+            else if (strcmp(choice, "2") == 0) {
+                printf("Message received: Palindrome Check\n");
+                printf("Client input for Palindrome: %s\n", data);
+                printf("Checking request...\n");
+                if (palindrome(data)) {
+                    printf("Result processed: Palindrome is correct\n");
+                    strcpy(buf, "Result: It is a Palindrome.");
+                } else {
+                    printf("Result processed: Palindrome is incorrect\n");
+                    strcpy(buf, "Result: Not a Palindrome.");
+                }
+                send(c_d, buf, strlen(buf) + 1, 0);
+            }
+            else {
+                printf("Received invalid choice from client: '%s' (data: '%s')\n", choice, data);
+                strcpy(buf, "Invalid choice! Enter 1 for echo, 2 for palindrome, or 3 to exit.");
+                send(c_d, buf, strlen(buf) + 1, 0);
+            }
+        }
+
+        close(c_d);
+        printf("Server is ready for a new client...\n");
+    }
+
+    close(s_d);
+    return 0;
+}
+[24bcs036@mepcolinux ex6]$cat client.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <termios.h>
+
+#define BUFFER_SIZE 1024
+
+void get_masked_password(char *password, int max_len) {
+    struct termios old_t, new_t;
+    int i = 0;
+    char ch;
+
+    tcgetattr(STDIN_FILENO, &old_t);
+    new_t = old_t;
+    new_t.c_lflag &= ~(ECHO | ICANON);
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_t);
+
+    while (i < max_len - 1) {
+        ch = getchar();
+        if (ch == '\n' || ch == '\r') {
+            break;
+        } else if ((ch == 127 || ch == 8) && i > 0) {
+            printf("\b \b");
+            fflush(stdout);
+            i--;
+        } else if (ch != 127 && ch != 8) {
+            password[i++] = ch;
+            printf("*");
+            fflush(stdout);
+        }
+    }
+    password[i] = '\0';
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_t);
+    printf("\n");
+}
+
+/* Helper to trim leading and trailing spaces/tabs */
+void trim_whitespace(char *str) {
+    char *start = str;
+    while (*start == ' ' || *start == '\t') start++;
+    char *end = start + strlen(start) - 1;
+    while (end > start && (*end == ' ' || *end == '\t')) end--;
+    *(end + 1) = '\0';
+    memmove(str, start, end - start + 2);
+}
+
+int main() {
+    int c_d;
+    struct sockaddr_in srv;
+    char buf[BUFFER_SIZE];
+    int bytes_received;
+    char server_ip[100];
+    int server_port;
+
+    c_d = socket(AF_INET, SOCK_STREAM, 0);
+    if (c_d < 0) {
+        perror("Socket creation failed");
+        exit(1);
+    }
+
+    printf("Enter Server IP Address (e.g., 172.16.16.200): ");
+    fgets(server_ip, sizeof(server_ip), stdin);
+    server_ip[strcspn(server_ip, "\r\n")] = 0;
+    trim_whitespace(server_ip);   /* remove accidental spaces */
+
+    printf("Enter Server Port Number: ");
+    fgets(buf, sizeof(buf), stdin);
+    server_port = atoi(buf);
+
+    srv.sin_family = AF_INET;
+    /* Use inet_pton instead of inet_addr to avoid false "Invalid IP" errors */
+    if (inet_pton(AF_INET, server_ip, &srv.sin_addr) <= 0) {
+        printf("Invalid IP address format.\n");
+        close(c_d);
+        exit(1);
+    }
+    srv.sin_port = htons(server_port);
+
+    if (connect(c_d, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+        perror("Connection to server failed");
+        close(c_d);
+        exit(1);
+    }
+    printf("Connected to server successfully!\n");
+
+    /* Authentication phase */
+    while (1) {
+        memset(buf, 0, sizeof(buf));
+        bytes_received = recv(c_d, buf, sizeof(buf) - 1, 0);
+        if (bytes_received <= 0) {
+            printf("Server closed connection during auth.\n");
+            close(c_d);
+            return 1;
+        }
+
+        if (strcmp(buf, "REQ_USERNAME") == 0) {
+            printf("Enter Gmail Address: ");
+            fgets(buf, sizeof(buf), stdin);
+            buf[strcspn(buf, "\r\n")] = 0;
+            send(c_d, buf, strlen(buf) + 1, 0);
+        }
+        else if (strcmp(buf, "REQ_PASSWORD") == 0) {
+            printf("Enter Password: ");
+            get_masked_password(buf, sizeof(buf));
+            send(c_d, buf, strlen(buf) + 1, 0);
+        }
+        else if (strcmp(buf, "AUTH_FAIL") == 0) {
+            printf("Wrong credentials. Please try again.\n");
+            /* server will ask for username again */
+        }
+        else if (strcmp(buf, "LOGIN_INVALID_FORMAT") == 0) {
+            printf("Login Terminated: Invalid Gmail syntax.\n");
+            printf("Requirements: Must end with '@gmail.com', have min 8 characters, and contain exactly ONE dot ('.').\n");
+            close(c_d);
+            return 0;
+        }
+        else if (strcmp(buf, "LOGIN_SUCCESS") == 0) {
+            printf("Login Approved! Access Granted.\n");
+            break;
+        }
+        else if (strcmp(buf, "AUTH_DENIED") == 0) {
+            printf("Login Failed: Incorrect credentials. Maximum retry attempts exceeded.\n");
+            close(c_d);
+            return 0;
+        }
+    }
+
+    /* Service phase */
+    while (1) {
+        char choice[10];
+        char text_input[BUFFER_SIZE - 10];
+
+        printf("\n---Operations to perform---\n\n");
+        printf("1. Echo\n");
+        printf("2. Palindrome Check\n");
+        printf("3. Exit\n");
+        printf("Choice: ");
+
+        fgets(choice, sizeof(choice), stdin);
+        choice[strcspn(choice, "\r\n")] = 0;
+
+        if (strcmp(choice, "3") == 0) {
+            send(c_d, "3", 2, 0);
+            printf("Exiting program...\n");
+            break;
+        }
+        else if (strcmp(choice, "1") == 0) {
+            printf("Enter Text for Echo: ");
+            fgets(text_input, sizeof(text_input), stdin);
+            text_input[strcspn(text_input, "\r\n")] = 0;
+
+            snprintf(buf, sizeof(buf), "1 %s", text_input);
+            send(c_d, buf, strlen(buf) + 1, 0);
+        }
+        else if (strcmp(choice, "2") == 0) {
+            printf("Enter String for Palindrome Check: ");
+            fgets(text_input, sizeof(text_input), stdin);
+            text_input[strcspn(text_input, "\r\n")] = 0;
+
+            snprintf(buf, sizeof(buf), "2 %s", text_input);
+            send(c_d, buf, strlen(buf) + 1, 0);
+        }
+        else {
+            snprintf(buf, sizeof(buf), "%s invalid_option", choice);
+            send(c_d, buf, strlen(buf) + 1, 0);
+        }
+
+        memset(buf, 0, sizeof(buf));
+        bytes_received = recv(c_d, buf, sizeof(buf) - 1, 0);
+        if (bytes_received <= 0) {
+            printf("Server disconnected.\n");
+            break;
+        }
+        printf("%s\n", buf);
+    }
+
+    close(c_d);
+    return 0;
+}
+
+output:
+1)server:
+Socket OK
+Bind OK on Generated Port: 40446
+=================================================
+Server is listening on all interfaces
+Server IP for client: 172.16.16.200
+Generated Port Number: 40446
+Tell the client to use the above IP and Port.
+=================================================
+Client connected
+Received username (Gmail) from client: hariprasad2@gmail.com
+Received password from client: hari@123
+User 'hariprasad2@gmail.com' authenticated successfully (attempt 1)
+Message received: Echo
+Client input for Echo: heloo
+Checking request...
+Client disconnected
+Server is ready for a new client...
+Client connected
+Received username (Gmail) from client: hariprasad2@gmail.com
+Received password from client: hari@123
+User 'hariprasad2@gmail.com' authenticated successfully (attempt 1)
+Message received: Echo
+Client input for Echo: hello
+Checking request...
+Message received: Palindrome Check
+Client input for Palindrome: malayalam
+Checking request...
+Result processed: Palindrome is correct
+Client requested to exit
+Server is ready for a new client...
+
+2)client:
+[24bcs041@mepcolinux ex6]$./client
+Enter Server IP Address (e.g., 172.16.16.200): 172.16.16.200
+Enter Server Port Number: 40446
+Connected to server successfully!
+Enter Gmail Address: hariprasad2@gmail.com
+Enter Password: ********
+Login Approved! Access Granted.
+
+---Operations to perform---
+
+1. Echo
+2. Palindrome Check
+3. Exit
+Choice: 1
+Enter Text for Echo: hello
+Echo: hello
+
+---Operations to perform---
+
+1. Echo
+2. Palindrome Check
+3. Exit
+Choice: 2
+Enter String for Palindrome Check: malayalam
+Result: It is a Palindrome.
+
+---Operations to perform---
+
+1. Echo
+2. Palindrome Check
+3. Exit
+Choice: 3
+Exiting program...
+[24bcs036@mepcolinux ex6]$exit
+exit
