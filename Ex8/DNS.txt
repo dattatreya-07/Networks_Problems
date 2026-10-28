@@ -1,0 +1,746 @@
+[24bcs036@mepcolinux ex8]$cat ex8.prn
+Script started on Thu Oct 15 10:18:29 2026
+[24bcs036@mepcolinux ex8]$cat server11.c
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+
+#define DEFAULT_PORT 3000
+#define BUFFER_SIZE 1024
+#define MAX_CACHE 100
+
+#define CACHE_FILE     "dns_cache.txt"
+#define CREDENTIALS_FILE "credentials.txt"
+
+/* Only one client allowed at a time */
+int client_socket = -1;
+int client_authenticated = 0;
+
+/* ---------- DNS Cache ---------- */
+typedef struct {
+    char domain[256];
+    char type[8];
+    char ip[INET6_ADDRSTRLEN];
+} CacheEntry;
+
+CacheEntry cache[MAX_CACHE];
+int cache_count = 0;
+
+void load_cache(void)
+{
+    FILE *fp = fopen(CACHE_FILE, "r");
+    if (!fp)
+        return;
+
+    while (cache_count < MAX_CACHE &&
+           fscanf(fp, "%255s %7s %63s",
+                  cache[cache_count].domain,
+                  cache[cache_count].type,
+                  cache[cache_count].ip) == 3) {
+        cache_count++;
+    }
+    fclose(fp);
+}
+
+void save_cache(void)
+{
+    FILE *fp = fopen(CACHE_FILE, "w");
+    if (!fp)
+        return;
+
+    for (int i = 0; i < cache_count; i++)
+        fprintf(fp, "%s %s %s\n",
+                cache[i].domain, cache[i].type, cache[i].ip);
+
+    fclose(fp);
+}
+
+int find_in_cache(const char *domain, const char *type,
+                  char *ip, size_t len)
+{
+    for (int i = 0; i < cache_count; i++) {
+        if (strcmp(cache[i].domain, domain) == 0 &&
+            strcmp(cache[i].type, type) == 0) {
+            strncpy(ip, cache[i].ip, len - 1);
+            ip[len - 1] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void add_to_cache(const char *domain, const char *type,
+                  const char *ip)
+{
+    if (cache_count >= MAX_CACHE)
+        return;
+
+    strncpy(cache[cache_count].domain, domain,
+            sizeof(cache[0].domain) - 1);
+    strncpy(cache[cache_count].type, type,
+            sizeof(cache[0].type) - 1);
+    strncpy(cache[cache_count].ip, ip,
+            sizeof(cache[0].ip) - 1);
+
+    cache[cache_count].domain[sizeof(cache[0].domain) - 1] = '\0';
+    cache[cache_count].type[sizeof(cache[0].type) - 1] = '\0';
+    cache[cache_count].ip[sizeof(cache[0].ip) - 1] = '\0';
+
+    cache_count++;
+    save_cache();
+}
+
+/* ---------- Authentication ---------- */
+int check_credentials(const char *user, const char *pass)
+{
+    FILE *fp = fopen(CREDENTIALS_FILE, "r");
+    if (!fp) {
+        perror("Unable to open credentials file");
+        return 0;
+    }
+
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+        char *file_user = strtok(line, " \t\r\n");
+        char *file_pass = strtok(NULL, " \t\r\n");
+
+        if (file_user && file_pass &&
+            strcmp(file_user, user) == 0 &&
+            strcmp(file_pass, pass) == 0) {
+            fclose(fp);
+            return 1;
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+/* ---------- Helpers ---------- */
+int sendAll(int sock, const char *message)
+{
+    size_t total = 0;
+    size_t len = strlen(message);
+
+    while (total < len) {
+        ssize_t n = send(sock, message + total, len - total, 0);
+        if (n <= 0)
+            return -1;
+        total += (size_t)n;
+    }
+    return 0;
+}
+
+int receiveLine(int sock, char *buffer, size_t size)
+{
+    size_t i = 0;
+
+    while (i < size - 1) {
+        char ch;
+        ssize_t n = recv(sock, &ch, 1, 0);
+
+        if (n <= 0)
+            return -1;
+
+        if (ch == '\n')
+            break;
+
+        buffer[i++] = ch;
+    }
+
+    buffer[i] = '\0';
+    return (int)i;
+}
+
+/* ---------- Broadcast ---------- */
+void broadcastMessage(int sender, const char *message)
+{
+    char output[BUFFER_SIZE];
+
+    snprintf(output, sizeof(output), "%s\n", message);
+    printf("%s", output);
+
+    if (client_socket > 0 && client_authenticated &&
+        sender != client_socket) {
+
+        if (sendAll(client_socket, output) < 0) {
+            printf("Client disconnected.\n");
+            close(client_socket);
+            client_socket = -1;
+            client_authenticated = 0;
+        }
+    }
+}
+
+/* ---------- DNS Lookup ---------- */
+void dnsLookup(int sock, char *domain, char *type)
+{
+    struct addrinfo hints, *result, *p;
+    char response[BUFFER_SIZE];
+    char address[INET6_ADDRSTRLEN];
+    int family;
+
+    if (strcmp(type, "A") == 0)
+        family = AF_INET;
+    else if (strcmp(type, "AAAA") == 0)
+        family = AF_INET6;
+    else {
+        sendAll(sock, "Use record type A or AAAA.\n");
+        return;
+    }
+
+    /* Check cache first */
+    if (find_in_cache(domain, type, address, sizeof(address))) {
+        snprintf(response, sizeof(response),
+                 "DNS result (cached): %s %s = %s\n",
+                 domain, type, address);
+        sendAll(sock, response);
+        return;
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int status = getaddrinfo(domain, NULL, &hints, &result);
+
+    if (status != 0) {
+        snprintf(response, sizeof(response),
+                 "DNS lookup failed for %s: %s\n",
+                 domain, gai_strerror(status));
+        sendAll(sock, response);
+        return;
+    }
+
+    int found = 0;
+
+    for (p = result; p != NULL; p = p->ai_next) {
+        void *addr;
+
+        if (p->ai_family == AF_INET)
+            addr = &((struct sockaddr_in *)p->ai_addr)->sin_addr;
+        else
+            addr = &((struct sockaddr_in6 *)p->ai_addr)->sin6_addr;
+
+        if (inet_ntop(p->ai_family, addr,
+                      address, sizeof(address)) != NULL) {
+
+            snprintf(response, sizeof(response),
+                     "DNS result: %s %s = %s\n",
+                     domain, type, address);
+
+            sendAll(sock, response);
+            found = 1;
+            break;
+        }
+    }
+
+    if (!found) {
+        sendAll(sock, "No matching IP address found.\n");
+    } else {
+        add_to_cache(domain, type, address);
+    }
+
+    freeaddrinfo(result);
+}
+
+/* ---------- Main ---------- */
+int main(int argc, char *argv[])
+{
+    int serverSocket;
+    struct sockaddr_in serverAddress;
+    fd_set readfds;
+    char buffer[BUFFER_SIZE];
+    int port = DEFAULT_PORT;
+
+    if (argc > 1)
+        port = atoi(argv[1]);
+
+    load_cache();
+
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        perror("Socket creation failed");
+        return 1;
+    }
+
+    int opt = 1;
+    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR,
+               &opt, sizeof(opt));
+
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
+    serverAddress.sin_port = htons(port);
+
+    if (bind(serverSocket, (struct sockaddr *)&serverAddress,
+             sizeof(serverAddress)) < 0) {
+        perror("Bind failed");
+        close(serverSocket);
+        return 1;
+    }
+
+    /* Backlog of 1 so only one extra client can queue and wait */
+    if (listen(serverSocket, 1) < 0) {
+        perror("Listen failed");
+        close(serverSocket);
+        return 1;
+    }
+
+    printf("TCP Server started on port %d\n", port);
+    printf("Only one client at a time. Others will wait.\n");
+    printf("Type a message and press Enter to broadcast it.\n");
+
+    while (1) {
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+
+        int maxfd = STDIN_FILENO;
+
+        /* Only watch for new connections if nobody is active */
+        if (client_socket == -1) {
+            FD_SET(serverSocket, &readfds);
+            if (serverSocket > maxfd)
+                maxfd = serverSocket;
+        } else {
+            FD_SET(client_socket, &readfds);
+            if (client_socket > maxfd)
+                maxfd = client_socket;
+        }
+
+        int activity = select(maxfd + 1, &readfds,
+                              NULL, NULL, NULL);
+
+        if (activity < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("select");
+            break;
+        }
+
+        /* Server operator message */
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
+                buffer[strcspn(buffer, "\n")] = '\0';
+
+                if (buffer[0] != '\0') {
+                    char message[BUFFER_SIZE];
+                    snprintf(message, sizeof(message),
+                             "SERVER: %s", buffer);
+                    broadcastMessage(-1, message);
+                }
+            }
+        }
+
+        /* Accept new client (only when idle) */
+        if (client_socket == -1 && FD_ISSET(serverSocket, &readfds)) {
+            struct sockaddr_in clientAddress;
+            socklen_t clientLength = sizeof(clientAddress);
+
+            int newSocket = accept(
+                serverSocket,
+                (struct sockaddr *)&clientAddress,
+                &clientLength);
+
+            if (newSocket >= 0) {
+                client_socket = newSocket;
+                client_authenticated = 0;
+
+                printf("Client connected: %s:%d\n",
+                       inet_ntoa(clientAddress.sin_addr),
+                       ntohs(clientAddress.sin_port));
+
+                sendAll(client_socket, "AUTH_REQUIRED\n");
+            }
+        }
+
+        /* Handle active client traffic */
+        if (client_socket > 0 && FD_ISSET(client_socket, &readfds)) {
+            int bytes = receiveLine(client_socket, buffer, sizeof(buffer));
+
+            if (bytes <= 0) {
+                printf("Client disconnected.\n");
+                close(client_socket);
+                client_socket = -1;
+                client_authenticated = 0;
+            } else {
+                printf("Received: %s\n", buffer);
+
+                /* ---- Authentication ---- */
+                if (!client_authenticated) {
+                    if (strncmp(buffer, "AUTH|", 5) == 0) {
+                        char *saveptr;
+                        strtok_r(buffer, "|", &saveptr);
+
+                        char *user = strtok_r(NULL, "|", &saveptr);
+                        char *pass = strtok_r(NULL, "|", &saveptr);
+
+                        if (user != NULL && pass != NULL &&
+                            check_credentials(user, pass)) {
+
+                            client_authenticated = 1;
+                            sendAll(client_socket, "AUTH_SUCCESS\n");
+                            sendAll(client_socket, "Connected to TCP server.\n");
+                            printf("Client authenticated as %s\n", user);
+                        } else {
+                            sendAll(client_socket, "AUTH_FAIL\n");
+                            close(client_socket);
+                            client_socket = -1;
+                            client_authenticated = 0;
+                        }
+                    } else {
+                        sendAll(client_socket, "AUTH_REQUIRED\n");
+                    }
+                }
+                /* ---- Authenticated commands ---- */
+                else {
+                    if (strncmp(buffer, "DNS|", 4) == 0) {
+                        char *saveptr;
+                        strtok_r(buffer, "|", &saveptr);
+
+                        char *domain = strtok_r(NULL, "|", &saveptr);
+                        char *type   = strtok_r(NULL, "|", &saveptr);
+
+                        if (domain != NULL && type != NULL)
+                            dnsLookup(client_socket, domain, type);
+                        else
+                            sendAll(client_socket, "Invalid DNS request.\n");
+                    }
+                    else if (strcmp(buffer, "CHAT") == 0) {
+                        sendAll(client_socket,
+                            "Chat mode enabled. Type BYE to leave.\n");
+                    }
+                    else if (strcmp(buffer, "BYE") == 0) {
+                        printf("Client left chat mode.\n");
+                    }
+                    else if (strncmp(buffer, "MSG|", 4) == 0) {
+                        char message[BUFFER_SIZE];
+                        snprintf(message, sizeof(message),
+                                 "Client: %.1000s", buffer + 4);
+                        broadcastMessage(client_socket, message);
+                    }
+                    else {
+                        sendAll(client_socket, "Unknown command.\n");
+                    }
+                }
+            }
+        }
+    }
+
+    close(serverSocket);
+    return 0;
+}
+[24bcs036@mepcolinux ex8]$cat client11.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+
+#define BUFFER_SIZE 1024
+
+int sendAll(int sock, const char *message)
+{
+    size_t total = 0;
+    size_t len = strlen(message);
+
+    while (total < len) {
+        ssize_t n = send(sock, message + total, len - total, 0);
+        if (n <= 0)
+            return -1;
+        total += (size_t)n;
+    }
+    return 0;
+}
+
+int receiveLine(int sock, char *buffer, size_t size)
+{
+    size_t i = 0;
+
+    while (i < size - 1) {
+        char ch;
+        ssize_t n = recv(sock, &ch, 1, 0);
+
+        if (n <= 0)
+            return -1;
+
+        if (ch == '\n')
+            break;
+
+        buffer[i++] = ch;
+    }
+
+    buffer[i] = '\0';
+    return (int)i;
+}
+
+void clearInputBuffer(void)
+{
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF) {}
+}
+
+/* ---------- Iterative DNS ---------- */
+void dnsLookup(int sock)
+{
+    char domain[256], type[32];
+    char request[BUFFER_SIZE], response[BUFFER_SIZE];
+
+    while (1) {
+        printf("Enter domain name (-1 to return to menu): ");
+        if (scanf("%255s", domain) != 1)
+            return;
+
+        if (strcmp(domain, "-1") == 0)
+            break;
+
+        printf("Record type (A / AAAA): ");
+        if (scanf("%31s", type) != 1)
+            return;
+
+        snprintf(request, sizeof(request),
+                 "DNS|%.255s|%.31s\n", domain, type);
+
+        if (sendAll(sock, request) < 0) {
+            printf("Failed to send DNS request.\n");
+            return;
+        }
+
+        if (receiveLine(sock, response, sizeof(response)) > 0)
+            printf("%s\n", response);
+        else {
+            printf("Server disconnected.\n");
+            return;
+        }
+    }
+}
+
+/* ---------- Chat ---------- */
+void chatMode(int sock)
+{
+    fd_set readfds;
+    char input[BUFFER_SIZE];
+    char message[BUFFER_SIZE];
+    char response[BUFFER_SIZE];
+
+    if (sendAll(sock, "CHAT\n") < 0)
+        return;
+
+    if (receiveLine(sock, response, sizeof(response)) <= 0) {
+        printf("Server disconnected.\n");
+        return;
+    }
+
+    printf("\n%s\n", response);
+    printf("Type messages and press Enter.\n");
+    printf("Type BYE to return to the main menu.\n");
+
+    while (1) {
+        FD_ZERO(&readfds);
+        FD_SET(STDIN_FILENO, &readfds);
+        FD_SET(sock, &readfds);
+
+        int maxfd = sock > STDIN_FILENO ? sock : STDIN_FILENO;
+
+        printf("> ");
+        fflush(stdout);
+
+        if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0)
+            continue;
+
+        /* Incoming broadcast */
+        if (FD_ISSET(sock, &readfds)) {
+            int n = receiveLine(sock, response, sizeof(response));
+
+            if (n <= 0) {
+                printf("\nServer disconnected.\n");
+                return;
+            }
+
+            printf("\n%s\n", response);
+            printf("> ");
+            fflush(stdout);
+        }
+
+        /* Outgoing message or BYE */
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            if (fgets(input, sizeof(input), stdin) == NULL)
+                return;
+
+            input[strcspn(input, "\n")] = '\0';
+
+            if (strcmp(input, "BYE") == 0) {
+                if (sendAll(sock, "BYE\n") < 0) {
+                    printf("Failed to send BYE.\n");
+                    return;
+                }
+                printf("Exited chat mode.\n");
+                break;
+            }
+
+            snprintf(message, sizeof(message),
+                     "MSG|%.1018s\n", input);
+
+            if (sendAll(sock, message) < 0) {
+                printf("Failed to send message.\n");
+                return;
+            }
+        }
+    }
+}
+
+/* ---------- Main ---------- */
+int main(void)
+{
+    int sock, choice;
+    struct sockaddr_in serverAddress;
+    char buffer[BUFFER_SIZE];
+    char server_ip[64];
+    int server_port;
+    char username[128], password[128];
+    char auth_msg[BUFFER_SIZE];
+
+    printf("Enter server IP: ");
+    if (scanf("%63s", server_ip) != 1) {
+        printf("Invalid input.\n");
+        return 1;
+    }
+
+    printf("Enter server port: ");
+    if (scanf("%d", &server_port) != 1) {
+        printf("Invalid input.\n");
+        return 1;
+    }
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Socket creation failed");
+        return 1;
+    }
+
+    memset(&serverAddress, 0, sizeof(serverAddress));
+    serverAddress.sin_family = AF_INET;
+    serverAddress.sin_port = htons(server_port);
+    serverAddress.sin_addr.s_addr = inet_addr(server_ip);
+
+    printf("Connecting... (if server is busy you will wait here)\n");
+
+    if (connect(sock, (struct sockaddr *)&serverAddress,
+                sizeof(serverAddress)) < 0) {
+        perror("Connection failed");
+        close(sock);
+        return 1;
+    }
+
+    printf("Connected to TCP server.\n");
+
+    /* Wait for auth request from server */
+    if (receiveLine(sock, buffer, sizeof(buffer)) > 0)
+        printf("%s\n", buffer);
+    else {
+        printf("Server closed connection unexpectedly.\n");
+        close(sock);
+        return 1;
+    }
+
+    printf("Username: ");
+    if (scanf("%127s", username) != 1) {
+        close(sock);
+        return 1;
+    }
+
+    printf("Password: ");
+    if (scanf("%127s", password) != 1) {
+        close(sock);
+        return 1;
+    }
+
+    snprintf(auth_msg, sizeof(auth_msg),
+             "AUTH|%s|%s\n", username, password);
+    sendAll(sock, auth_msg);
+
+    if (receiveLine(sock, buffer, sizeof(buffer)) > 0) {
+        if (strcmp(buffer, "AUTH_SUCCESS") != 0) {
+            printf("Authentication failed: %s\n", buffer);
+            close(sock);
+            return 1;
+        }
+        printf("%s\n", buffer);
+    } else {
+        printf("Server disconnected during authentication.\n");
+        close(sock);
+        return 1;
+    }
+
+    if (receiveLine(sock, buffer, sizeof(buffer)) > 0)
+        printf("%s\n", buffer);
+
+    while (1) {
+        printf("\n===== TCP CLIENT MENU =====\n");
+        printf("1. DNS Lookup\n");
+        printf("2. Chat\n");
+        printf("3. Exit\n");
+        printf("Enter choice: ");
+
+        if (scanf("%d", &choice) != 1)
+            break;
+
+        clearInputBuffer();
+
+        if (choice == 1) {
+            dnsLookup(sock);
+        }
+        else if (choice == 2) {
+            chatMode(sock);
+        }
+        else if (choice == 3) {
+            break;
+        }
+        else {
+            printf("Invalid choice.\n");
+        }
+    }
+
+    close(sock);
+    printf("Client closed.\n");
+
+    return 0;
+}
+[24bcs036@mepcolinux ex8]$cat credentials.txt
+username1 password1
+username2 password2
+username3 password3
+[24bcs036@mepcolinux ex8]$./server
+TCP Server started on port 3007
+Type a message and press Enter to broadcast it.
+hi 
+SERVER: hi 
+hello
+SERVER: hello
+^C
+[24bcs036@mepcolinux ex8]$./client
+Enter server IP: 127.0.0.1
+Enter server port: 3007
+Connection failed: Connection refused
+[24bcs036@mepcolinux ex8]$cat dns_cache.txt
+www.google.com A 142.251.152.119
+www.indmoney.com A 104.18.31.240
+www.youtube.com A 142.251.152.4
+www.vested.com A 96.47.75.32
+1 A 0.0.0.1
+2 A 0.0.0.2
+10 A 0.0.0.10
+[24bcs036@mepcolinux ex8]$exit
+exit
+
+Script done on Thu Oct 15 10:19:37 2026
